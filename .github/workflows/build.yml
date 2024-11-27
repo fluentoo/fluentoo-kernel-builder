@@ -1,0 +1,85 @@
+---
+
+name: Build FluentooOS customized kernel
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 0 * * *"
+env:
+  CONTAINER_NAME: fluentoo-build-environment
+  KERNEL_CONFIG_DIR: /etc/kernel/config.d
+
+jobs:
+  build:
+    name: Build Kernel for RaspberryPI 4
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set CPUS environment variable
+        run: |
+          echo "CPUS=$(nproc --all)" >> ${GITHUB_ENV}
+
+      - name: Pull latest ${{ env.CONTAINER_NAME }} image
+        run: |
+          docker pull docker.io/expeditioneer/fluentoo-build-environment
+
+      - name: Create ${{ env.CONTAINER_NAME }} container
+        run: |
+          docker create \
+          --name ${{ env.CONTAINER_NAME }} \
+          --platform linux/arm64 \
+          --privileged \
+          --rm \
+          --volume /srv/fluentoo/binary_packages:/var/cache/binpkgs \
+          --workdir ${{ github.workspace }} \
+          docker.io/expeditioneer/fluentoo-build-environment \
+          tail --follow /dev/null
+
+      - name: Start ${{ env.CONTAINER_NAME }} Container
+        run: |
+          docker start ${{ env.CONTAINER_NAME }}
+
+      - name: Determine Kernel Version and set major, minor and hotfix kernel version environment variable
+        run: |
+          kernel_version=($(docker exec ${{ env.CONTAINER_NAME }} sh -c "basename \$(equery which sys-kernel/gentoo-sources) | sed -e 's/gentoo-sources-//g' | sed -e 's/.ebuild//g' | tr '.' '\n'"))
+          echo "KERNEL_MAJOR_VERSION=${kernel_version[0]}" >> ${GITHUB_ENV}
+          echo "KERNEL_MINOR_VERSION=${kernel_version[1]}" >> ${GITHUB_ENV}
+          echo "KERNEL_HOTFIX_VERSION=${kernel_version[2]}" >> ${GITHUB_ENV}          
+
+      # WORKAROUND: see https://github.com/pkgcore/pkgcore/issues/303
+      - name: 'Workaround for: "error: repos.conf: default repo "gentoo" is undefined or invalid"'
+        run: |
+          echo "WORKAROUND: see https://github.com/pkgcore/pkgcore/issues/303"    
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents /etc/portage/repos.conf'
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf'
+
+      - name: Create local overlay and necessary directory structure for FluentooOS-kernel ebuild
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'eselect repository create local'
+          docker exec --workdir /var/db/repos/local ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents sys-kernel/fluentoo-kernel-bin'  
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents files'
+
+      - name: Create FluentooOS-kernel ebuild
+        run: |
+          docker cp ebuild/fluentoo-kernel-bin.use ${{ env.CONTAINER_NAME }}:/etc/portage/package.use/fluentoo-kernel-bin
+          docker cp ebuild/fluentoo-kernel-bin.ebuild.j2 ${{ env.CONTAINER_NAME }}:/var/db/repos/local/sys-kernel/fluentoo-kernel-bin/fluentoo-kernel-bin-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.${{ env.KERNEL_HOTFIX_VERSION }}.ebuild
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin/files ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --remote-name \
+                      "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'pkgdev manifest'
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'pkgcheck scan'
+
+      - name: Copy Kernel configuration customization snippets
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents ${{ env.KERNEL_CONFIG_DIR }}'
+          docker cp kernel/config.d ${{ env.CONTAINER_NAME }}:/etc/kernel/
+
+      # TODO: add buildbinpkg
+      - name: Compile Fluentoo Kernel
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'emerge fluentoo-kernel-bin'
+
+      # TODO: create release with attached binpkg

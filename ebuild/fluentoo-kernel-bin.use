@@ -1,0 +1,2 @@
+# Required changed use flags for fluentoo-kernel-bin
+sys-kernel/installkernel    dracut
